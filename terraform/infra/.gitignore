@@ -1,0 +1,4 @@
+.terraform
+.terraform.*
+jenkins.yaml
+*.auto.tfvars

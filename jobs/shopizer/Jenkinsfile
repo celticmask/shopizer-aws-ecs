@@ -1,0 +1,165 @@
+#!groovy
+
+node ('ec2-builder'){
+    //currentBuild.displayName = "#${BUILD_NUMBER}"
+    def apiRepositoryUrl        = "https://github.com/shopizer-ecommerce/shopizer.git"
+    def feRepositoryUrl         = "https://github.com/shopizer-ecommerce/shopizer-shop-reactjs.git"
+    def adminRepositoryUrl      = "https://github.com/shopizer-ecommerce/shopizer-admin.git"
+    def terraformRepositoryUrl  = "https://github.com/celticmask/shopizer-aws-ecs.git"
+    def mavenImage              = "maven:3.8.1-adoptopenjdk-11"
+    def nodeImage               = "node:12.22.7"
+    def awsRegion               = "eu-central-1"
+    def dockerEcr               = "623550112002.dkr.ecr.${awsRegion}.amazonaws.com"
+    def imageTag                = "latest"
+    def varsMap = [
+        image_tag: imageTag
+    ]
+    
+    stage('Git checkout') {
+        cleanWs()
+        dir('api') {
+            checkoutRepository(apiRepositoryUrl, 'master')
+        }
+        dir('fe') {
+            checkoutRepository(feRepositoryUrl, 'main')
+        }
+        dir('admin') {
+            checkoutRepository(adminRepositoryUrl, 'main')
+        }
+        dir('infra') {
+            checkoutRepository(terraformRepositoryUrl, 'development')
+        }
+    }
+
+    stage('SonarQube analysis') {
+        def scannerHome = tool 'sonar_scanner';
+        dir('api') {
+            withSonarQubeEnv('SonarQube') {
+                sh "${scannerHome}/bin/sonar-scanner -Dsonar.projectKey=shopizer-api -Dsonar.java.binaries=."
+            }
+        }
+        dir('fe') {
+            withSonarQubeEnv('SonarQube') {
+                sh "${scannerHome}/bin/sonar-scanner -Dsonar.projectKey=shopizer-frontend"
+            }
+        }
+        dir('admin') {
+            withSonarQubeEnv('SonarQube') {
+                sh "${scannerHome}/bin/sonar-scanner -Dsonar.projectKey=shopizer-admin"
+            }
+        }
+    }
+
+    /*
+    stage("SonarQube Quality Gate") {
+        waitForQualityGate abortPipeline: true
+    }
+    */
+
+    stage('Terraform deploy') {
+        dir('infra/terraform/app') {
+            terraformPerform('apply', varsMap)
+        }
+    }
+
+    stage('Build/Push API') {
+        def repositoryName  = "shopizer-api"
+        def dockerImageName = "${dockerEcr}/${repositoryName}:${imageTag}"
+
+        dir('api'){
+            docker.image(mavenImage).inside() {
+                sh "mvn clean install"
+            }
+            // Inject Contrast Security
+            dir('sm-shop') {
+                withCredentials([file(credentialsId: 'contrast_security', variable: 'FILE')]) {
+                    sh "cp -f $FILE ."
+                    sh "curl -L 'https://repository.sonatype.org/service/local/artifact/maven/redirect?r=central-proxy&g=com.contrastsecurity&a=contrast-agent&v=LATEST' -o contrast.jar"
+                    def image = docker.build(dockerImageName, "./")
+                    pushImage(image)
+                }
+                // Reporting
+                junit testResults: '**/target/surefire-reports/*.xml', skipPublishingChecks: true
+            }
+        }
+    }
+
+/*
+    stage('Contrast Security Verification'){
+        contrastAgent outputDirectory: env.WORKSPACE, agentType: 'Java'
+        sh 'nohup java -javaagent:./contrast.jar -Dcontrast.server=https://ce.contrastsecurity.com/Contrast -Dcontrast.override.appversion=${JOB_NAME}-${BUILD_NUMBER} -Dcontrast.application.session_metadata="buildNumber=${BUILD_NUMBER}" -Dcontrast.standalone.appname=shopizer -Dserver.port=8080 -jar ${WORKSPACE}/api/sm-shop/target/shopizer.jar&'
+    }
+*/
+    stage('Build/Push Frontend') {
+        def repositoryName  = "shopizer-frontend"
+        def dockerImageName = "${dockerEcr}/${repositoryName}:${imageTag}"        
+        dir('fe') {
+            def image = docker.build(dockerImageName, "./")
+            pushImage(image)
+        }
+    }
+
+    stage('Build/Push Admin panel') {
+        def repositoryName  = "shopizer-admin"
+        def dockerImageName = "${dockerEcr}/${repositoryName}:${imageTag}"        
+        dir('admin'){
+            docker.image(nodeImage).inside() {
+                sh "rm package-lock.json"
+                sh "npm install"
+                sh "./node_modules/@angular/cli/bin/ng build --prod"
+            }   
+            def image = docker.build(dockerImageName, "./")
+            pushImage(image)
+        }
+    }
+
+    stage ('OWASP Dependency-Check') {
+        dependencyCheck additionalArguments: ''' 
+            -o "./" 
+            -s "./api"
+            -f "ALL" 
+            --prettyPrint''', odcInstallation: 'OWASP-DC'
+        dependencyCheckPublisher pattern: 'dependency-check-report.xml'
+    }
+
+    stage('OWASP ZAP analysis') {
+        docker.image("owasp/zap2docker-stable").inside("-v $WORKSPACE:/zap/wrk/:rw") {
+            sh "zap-full-scan.py -t https://shopizer.rootin.cc -r index.html || true"
+            sh "cp -f /zap/wrk/index.html ./zap_report.html"
+        }
+        publishHTML([allowMissing: false, alwaysLinkToLastBuild: false, keepAll: true, reportDir: '', reportFiles: 'zap_report.html', reportName: 'ZAP Scan', reportTitles: 'ZAP Full Scan'])
+    }
+}
+
+def checkoutRepository(repoUrl, branch) {
+    checkout([
+        $class: "GitSCM",
+        doGenerateSubmoduleConfigurations: false, 
+        submoduleCfg: [],       
+        userRemoteConfigs:[[ url: repoUrl ]],
+        branches:[[ name: branch]]
+    ])
+}
+
+def terraformPerform(action, varsMap) {
+    String vars = ""
+    varsMap.each{itemKey,itemValue->
+        vars = vars + " -var '${itemKey}=${itemValue}'"    
+    }
+    timeout(time: 1, unit: 'HOURS') {
+        ansiColor('xterm') {
+            timestamps {
+                sh "terraform init"
+                sh "terraform validate"
+                sh "terraform ${action} -auto-approve ${vars}"
+            }
+        }
+    }
+}
+
+def pushImage(image) {
+    withAWS(useNode: true) {    
+        sh("set +x; eval \$(aws ecr get-login --region=eu-central-1 --no-include-email | sed 's|https://||')")
+        image.push()
+    }
+}
